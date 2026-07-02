@@ -255,17 +255,19 @@ def dequantize_weight(
     weight: torch.Tensor,
     scale: torch.Tensor,
     target_dtype: torch.dtype,
+    block: tuple[int, int],
 ) -> torch.Tensor:
     """Dequantize FP8 codes with their 2D block-scale grid (fp32 intermediate).
 
-    The block size is inferred from the weight/scale shapes (the strict grid
-    check against the declared block size lives in
-    :func:`verify_observations`). Pure; returns a new tensor.
+    *block* is the DECLARED block size (from the sidecar), not inferred from the
+    tensor shapes. Inferring `ceil(weight/scale)` would place block boundaries
+    wrong for any weight dimension not divisible by the block (the last block is
+    partial), silently dequantizing with the wrong per-block scale while
+    :func:`verify_observations` — which also uses the declared block — still
+    passes. `expand_block_scale` rejects a scale grid that disagrees with the
+    declared block, so a mismatch raises here (before the weight is yielded)
+    rather than corrupting silently. Pure; returns a new tensor.
     """
-    block = (
-        math.ceil(weight.shape[0] / scale.shape[0]),
-        math.ceil(weight.shape[1] / scale.shape[1]),
-    )
     full_scale = expand_block_scale(scale.to(torch.float32), tuple(weight.shape), block)
     return (weight.to(torch.float32) * full_scale).to(target_dtype)
 
@@ -461,6 +463,7 @@ class ModelOptNativeFp8CheckpointAdapter:
         n_pending = 0
         infos: list[TensorInfo] = []
         dequantized = 0
+        block = (self._spec.block_rows, self._spec.block_cols)  # declared, not inferred
 
         for full_name, tensor in weights:
             name = self._strip_prefix(full_name)
@@ -474,7 +477,7 @@ class ModelOptNativeFp8CheckpointAdapter:
                     dequantized += 1
                     yield (
                         pending_full_name,
-                        dequantize_weight(pending_weight, tensor, self._target_dtype),
+                        dequantize_weight(pending_weight, tensor, self._target_dtype, block),
                     )
                 continue
             if kind is TensorKind.QUANTIZER_AMAX:
@@ -487,7 +490,7 @@ class ModelOptNativeFp8CheckpointAdapter:
                 if scale_name in scales:
                     dequantized += 1
                     yield full_name, dequantize_weight(
-                        tensor, scales[scale_name], self._target_dtype
+                        tensor, scales[scale_name], self._target_dtype, block
                     )
                 else:
                     pending.setdefault(scale_name, []).append((full_name, tensor))
@@ -519,9 +522,20 @@ class ModelOptNativeFp8CheckpointAdapter:
 # --- CLI probe (header-only, GPU-free) -------------------------------------------
 
 
+# safetensors reference caps the JSON header at 100 MB; bound the read so a
+# malformed/hostile length field cannot request an arbitrary allocation (the
+# probe only runs against the trusted :ro mount, so this is defense-in-depth).
+_MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024 * 1024
+
+
 def _read_safetensors_header(path: str) -> dict:
     with open(path, "rb") as f:
         (header_len,) = struct.unpack("<Q", f.read(8))
+        if header_len > _MAX_SAFETENSORS_HEADER_BYTES:
+            raise CheckpointIntegrityError(
+                f"safetensors header of {path} is {header_len} bytes "
+                f"(> {_MAX_SAFETENSORS_HEADER_BYTES}); refusing to read"
+            )
         header = json.loads(f.read(header_len))
     header.pop("__metadata__", None)
     return header

@@ -11,6 +11,7 @@ checkpoint-integrity-verification).
 """
 
 import json
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -197,19 +198,59 @@ def test_expand_block_scale_rejects_grid_mismatch():
 
 def test_dequantize_weight_multiplies_codes_by_block_scale():
     weight, scale, _ = _quantized_pair("m.weight", scale_val=0.5)
-    out = mn.dequantize_weight(weight, scale, torch.bfloat16)
+    out = mn.dequantize_weight(weight, scale, torch.bfloat16, block=(128, 128))
     assert out.dtype == torch.bfloat16
     assert out.shape == weight.shape
     assert torch.allclose(out.float(), torch.full_like(out.float(), 1.0))
 
 
-def test_dequantize_uses_fp32_intermediate():
-    # bf16(448) * bf16(0.007813) in fp32 = 3.5 exactly; a pure-bf16 pipeline
-    # accumulates extra rounding. Assert the fp32-exact result.
-    weight = _fp8(torch.full((2, 2), 448.0))
-    scale = torch.full((1, 1), 0.0078125, dtype=torch.bfloat16)
-    out = mn.dequantize_weight(weight, scale, torch.bfloat16)
-    assert torch.allclose(out.float(), torch.full((2, 2), 3.5))
+def test_dequantize_applies_scale_at_full_precision():
+    # Pins the exact dequant value for a non-trivial (bf16-inexact) scale:
+    # 36 (exact in e4m3) x bf16(0.1) = 3.609375. A regression that mishandled
+    # the scale (e.g. used _amax instead of _scale, or skipped the fp32 upcast
+    # on a platform where bf16 mul rounds per-op) would miss this value.
+    # NOTE: on CPU the fp32 vs bf16 intermediate cannot be distinguished by
+    # output (e4m3 is exactly representable in bf16 and torch CPU bf16-mul
+    # accumulates in fp32); the .to(torch.float32) cast is for GPU parity, so
+    # this test pins the numeric contract rather than the intermediate dtype.
+    weight = _fp8(torch.full((1, 1), 36.0))
+    scale = torch.full((1, 1), 0.1, dtype=torch.bfloat16)
+    out = mn.dequantize_weight(weight, scale, torch.bfloat16, block=(1, 1))
+    fp32_ref = (weight.to(torch.float32) * scale.to(torch.float32)).to(torch.bfloat16)
+    assert out.dtype == torch.bfloat16
+    assert torch.equal(out, fp32_ref)
+    assert abs(out.item() - 3.609375) < 1e-6
+
+
+def test_dequantize_reconstructs_random_weight_within_tolerance():
+    # Real e4m3 blockwise round-trip (spec: "reconstructs the base weight",
+    # median rel err < 5%). Uses a NON-128-divisible, asymmetric shape so a
+    # wrong block boundary or transposed grid fails — locks Correctness-F1
+    # (declared block must be honored, not inferred from shapes).
+    torch.manual_seed(0)
+    rows, cols, block = 200, 384, 128           # 200 not divisible by 128
+    ob, ib = (rows + block - 1) // block, (cols + block - 1) // block  # 2, 3
+    ref = torch.randn(rows, cols, dtype=torch.float32) * 0.05
+    # per-block amax -> scale = amax/448; quantize codes = round-to-e4m3(w/scale)
+    scale = torch.zeros(ob, ib, dtype=torch.float32)
+    codes = torch.zeros(rows, cols, dtype=torch.float32)
+    for i in range(ob):
+        for j in range(ib):
+            r0, r1 = i * block, min((i + 1) * block, rows)
+            c0, c1 = j * block, min((j + 1) * block, cols)
+            blk = ref[r0:r1, c0:c1]
+            s = blk.abs().max().item() / 448.0 or 1e-8
+            scale[i, j] = s
+            codes[r0:r1, c0:c1] = (blk / s).to(torch.float8_e4m3fn).to(torch.float32)
+    w8 = codes.to(torch.float8_e4m3fn)
+    out = mn.dequantize_weight(w8, scale.to(torch.bfloat16), torch.bfloat16, block=(block, block))
+    assert out.shape == (rows, cols)
+    rel = (out.float() - ref).abs() / (ref.abs() + 1e-6)
+    assert rel.median().item() < 0.05, rel.median().item()
+    # A wrong (inferred-from-shape) block would misplace the row-128 boundary:
+    wrong = mn.dequantize_weight(w8, scale.to(torch.bfloat16), torch.bfloat16,
+                                 block=(math.ceil(rows / ob), math.ceil(cols / ib)))
+    assert not torch.equal(out, wrong)
 
 
 # --- unified verification (shared by adapter and CLI probe) -------------------
