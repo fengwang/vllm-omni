@@ -34,6 +34,7 @@ from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.hsdp import HSDPInferenceConfig, apply_hsdp_to_model
 from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
+    ModelOptNativeFp8CheckpointAdapter,
     get_checkpoint_adapter,
 )
 from vllm_omni.diffusion.model_loader.gguf_adapters import get_gguf_adapter
@@ -236,6 +237,10 @@ class DiffusersPipelineLoader:
         model: nn.Module | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
+        # Fail fast on a present-but-invalid quantization sidecar before file
+        # discovery can mask it with a generic "cannot find weights" error
+        # (no-op for checkpoints without a sidecar).
+        ModelOptNativeFp8CheckpointAdapter.validate_source_sidecar(source)
         _, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path,
             source.subfolder,

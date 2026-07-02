@@ -380,17 +380,13 @@ class ModelOptNativeFp8CheckpointAdapter:
         return str(getattr(source, "prefix", "")).startswith("transformer.")
 
     @classmethod
-    def detect(
-        cls,
-        source: object,
-        target_dtype: torch.dtype = torch.bfloat16,
-    ) -> "ModelOptNativeFp8CheckpointAdapter | None":
-        """Engage iff the source's local model dir carries a supported sidecar.
+    def _parse_source_sidecar(cls, source: object) -> BlockwiseQuantSpec | None:
+        """Read + validate the source dir's sidecar (Action at the boundary).
 
-        Returns None for unquantized checkpoints (no sidecar). Raises
-        :class:`CheckpointIntegrityError` when a sidecar exists but does not
-        describe the supported deliverable (fail fast — never load a
-        mislabeled checkpoint).
+        Returns None when the source is not a local transformer dir with a
+        sidecar. Raises :class:`CheckpointIntegrityError` when a sidecar
+        exists but does not describe the supported deliverable (fail fast —
+        never load a mislabeled checkpoint).
         """
         if not cls._is_transformer_source(source):
             return None
@@ -407,7 +403,33 @@ class ModelOptNativeFp8CheckpointAdapter:
             raise CheckpointIntegrityError(
                 f"unreadable quantization sidecar {sidecar_path}: {e}"
             ) from e
-        spec = parse_quant_spec(config)
+        return parse_quant_spec(config)
+
+    @classmethod
+    def validate_source_sidecar(cls, source: object) -> None:
+        """INV-P5-4 pre-flight: raise on a present-but-invalid sidecar.
+
+        Called by the loader *before* weight-file discovery so a mislabeled
+        quantized checkpoint dies with the integrity report rather than a
+        generic file-discovery error.
+        """
+        cls._parse_source_sidecar(source)
+
+    @classmethod
+    def detect(
+        cls,
+        source: object,
+        target_dtype: torch.dtype = torch.bfloat16,
+    ) -> "ModelOptNativeFp8CheckpointAdapter | None":
+        """Engage iff the source's local model dir carries a supported sidecar.
+
+        Returns None for unquantized checkpoints (no sidecar); raises like
+        :meth:`validate_source_sidecar` on an invalid one.
+        """
+        spec = cls._parse_source_sidecar(source)
+        if spec is None:
+            return None
+        model_dir = getattr(source, "model_or_path", None)
         logger.info(
             "ModelOpt-native FP8-blockwise checkpoint detected at %s "
             "(declared: %d quantized modules, %d scale tensors, %dx%d blocks)",

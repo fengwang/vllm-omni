@@ -303,6 +303,19 @@ def test_adapt_bounds_pending_buffer(tmp_path):
         list(adapter.adapt(iter(weights)))
 
 
+def test_validate_source_sidecar_is_a_loader_preflight(tmp_path):
+    # Called before weight-file discovery: no-op for plain and valid dirs,
+    # loud for a mislabeled (stale) sidecar (FA ordering: the integrity
+    # report must be the primary serve-path error, not a generic file error).
+    plain = _write_model_dir(tmp_path / "plain", None)
+    mn.ModelOptNativeFp8CheckpointAdapter.validate_source_sidecar(_source(plain))
+    good = _write_model_dir(tmp_path / "good", _authoritative_sidecar())
+    mn.ModelOptNativeFp8CheckpointAdapter.validate_source_sidecar(_source(good))
+    stale = _write_model_dir(tmp_path / "stale", _stale_sidecar())
+    with pytest.raises(mn.CheckpointIntegrityError):
+        mn.ModelOptNativeFp8CheckpointAdapter.validate_source_sidecar(_source(stale))
+
+
 def test_detect_paths(tmp_path):
     assert _detect(tmp_path / "plain", None) is None  # no sidecar -> not quantized
     with pytest.raises(mn.CheckpointIntegrityError):
