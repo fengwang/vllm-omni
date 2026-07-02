@@ -53,6 +53,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.model_loader.checkpoint_adapters.modelopt_native import assert_not_fp8
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
     ReferenceVideoDecodeSpec,
@@ -942,6 +943,11 @@ class Cosmos3OmniDiffusersPipeline(
         def _remapped_weights() -> Iterable[tuple[str, torch.Tensor]]:
             total = kept = 0
             for name, tensor in weights:
+                # Last-line guard: an fp8 tensor here means a quantized
+                # checkpoint bypassed its checkpoint adapter — loading it
+                # would silently drop the dequant scales (weights off by the
+                # per-block scale factor). Fail loudly instead.
+                assert_not_fp8(name, tensor.dtype)
                 total += 1
                 remapped = self._remap_ckpt_key(name)
                 if remapped is not None and (remapped in allowed or remapped in tp_aware):
