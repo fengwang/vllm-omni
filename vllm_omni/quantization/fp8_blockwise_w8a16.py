@@ -32,6 +32,7 @@ import re
 import torch
 import torch.nn.functional as F
 from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import LinearMethodBase
 
 logger = init_logger(__name__)
 
@@ -58,7 +59,7 @@ def is_target_prefix(prefix: str) -> bool:
     return bool(_TARGET_RE.search(prefix))
 
 
-class Fp8BlockwiseW8A16LinearMethod:
+class Fp8BlockwiseW8A16LinearMethod(LinearMethodBase):
     """Weight-only FP8 blockwise (W8A16) linear method: resident FP8 + JIT dequant.
 
     Keeps the target weight resident as ``float8_e4m3fn`` (1 byte/elem) plus its 2D
