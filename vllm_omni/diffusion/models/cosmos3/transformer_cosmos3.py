@@ -1084,6 +1084,16 @@ class Cosmos3VFMTransformer(nn.Module):
 
         dtype = od_config.dtype
         quant_config = getattr(od_config, "quantization_config", None) if od_config else None
+        # The Cosmos3 NVFP4 blockwise deliverable declares `quant_recipe` at the top
+        # level of transformer/config.json (not inside a nested `quantization_config`
+        # block that TransformerConfig.from_dict would parse). Resolve the W4A16
+        # target-inclusion config here so the MLP / MLP-MoE-gen projections load
+        # FP4-resident while everything else stays BF16 (Phase 5.1 INV-7).
+        from vllm_omni.quantization.nvfp4_blockwise import maybe_build_nvfp4_blockwise_config
+
+        quant_config = maybe_build_nvfp4_blockwise_config(
+            _tf_config_get(model_config, "quant_recipe", None), quant_config
+        )
 
         self.language_model = Cosmos3LanguageModel(
             hidden_size=self.hidden_size,

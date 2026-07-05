@@ -939,15 +939,25 @@ class Cosmos3OmniDiffusersPipeline(
         state = self.state_dict()
         allowed = set(state.keys())
         tp_aware = {n for n, p in self.named_parameters() if hasattr(p, "weight_loader")}
+        # ModelOpt NVFP4 W4A16 (nvfp4_blockwise) scale params carried through to
+        # the linear method: fp8 block scale (`.weight_scale`) + fp32 global
+        # scale (`.weight_scale_2`). These are quant-method inputs, not
+        # un-dequantized weights, so they are exempt from the fp8 bypass guard.
+        _QUANT_SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2")
 
         def _remapped_weights() -> Iterable[tuple[str, torch.Tensor]]:
             total = kept = 0
             for name, tensor in weights:
-                # Last-line guard: an fp8 tensor here means a quantized
-                # checkpoint bypassed its checkpoint adapter — loading it
-                # would silently drop the dequant scales (weights off by the
-                # per-block scale factor). Fail loudly instead.
-                assert_not_fp8(name, tensor.dtype)
+                # Last-line guard: an un-adapted fp8 *weight* here means a
+                # quantized checkpoint bypassed its checkpoint adapter — loading
+                # it would silently drop the dequant scales (weights off by the
+                # per-block scale factor). Fail loudly instead. The NVFP4 W4A16
+                # (nvfp4_blockwise) path is different: it keeps weights FP4 and
+                # loads fp8 block-scale params (`.weight_scale`) + fp32 global
+                # scales (`.weight_scale_2`) straight into the ModelOpt linear
+                # method, so those scale params are exempt from the guard.
+                if not name.endswith(_QUANT_SCALE_SUFFIXES):
+                    assert_not_fp8(name, tensor.dtype)
                 total += 1
                 remapped = self._remap_ckpt_key(name)
                 if remapped is not None and (remapped in allowed or remapped in tp_aware):

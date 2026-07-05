@@ -9,6 +9,7 @@ from .modelopt import (
     ModelOptNvFp4CheckpointAdapter,
 )
 from .modelopt_native import ModelOptNativeFp8CheckpointAdapter
+from .modelopt_native_nvfp4 import ModelOptNativeNvfp4CheckpointAdapter
 
 
 def _model_dtype(model: nn.Module) -> torch.dtype:
@@ -26,17 +27,25 @@ def get_checkpoint_adapter(
     | ModelOptNvFp4CheckpointAdapter
     | ModelOptMixedPrecisionCheckpointAdapter
     | ModelOptNativeFp8CheckpointAdapter
+    | ModelOptNativeNvfp4CheckpointAdapter
     | None
 ):
     if use_safetensors:
         # Checkpoint-driven (sidecar) detection; independent of quant_config.
         # Raises CheckpointIntegrityError on a present-but-unsupported sidecar
-        # (fail fast), returns None for unquantized checkpoints.
+        # (fail fast), returns None for unquantized checkpoints. NVFP4 and FP8
+        # native adapters key off distinct sidecar filenames, so order is safe;
+        # both must precede the generic quant_config-driven adapters below.
         native_adapter = ModelOptNativeFp8CheckpointAdapter.detect(
             source, target_dtype=_model_dtype(model)
         )
         if native_adapter is not None:
             return native_adapter
+        nvfp4_native_adapter = ModelOptNativeNvfp4CheckpointAdapter.detect(
+            source, target_dtype=_model_dtype(model)
+        )
+        if nvfp4_native_adapter is not None:
+            return nvfp4_native_adapter
     if ModelOptFp8CheckpointAdapter.is_compatible(source, quant_config, use_safetensors):
         return ModelOptFp8CheckpointAdapter(model, source)
     if ModelOptNvFp4CheckpointAdapter.is_compatible(source, quant_config, use_safetensors):
