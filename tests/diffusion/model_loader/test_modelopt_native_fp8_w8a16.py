@@ -21,6 +21,8 @@ from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
 )
 from vllm_omni.diffusion.model_loader.checkpoint_adapters.modelopt_native import (
     CheckpointIntegrityError,
+    dequantize_weight,
+    is_fp8_dtype,
     parse_quant_spec,
 )
 
@@ -225,3 +227,51 @@ def test_dispatch_flag_on_inert_without_fp8_sidecar(tmp_path, monkeypatch):
         torch.nn.Module(), _source(str(root)), quant_config=None, use_safetensors=True
     )
     assert not isinstance(adapter, ModelOptNativeFp8W8A16CheckpointAdapter)
+
+
+# --- adapter numerical correctness + edge cases (sharded-review hardening) ---
+
+
+def test_adapt_lm_head_dequant_numerically_correct():
+    w = _fp8(256, 128)
+    s = _scale(256, 128)
+    stream = [
+        ("transformer.lm_head.weight", w),
+        ("transformer.lm_head.weight_quantizer._scale", s),
+        ("transformer.lm_head.weight_quantizer._amax", _amax(256, 128)),
+    ]
+    out = dict(_adapter(_sidecar(n_quantized=1, n_scale=2)).adapt(stream))
+    got = out["transformer.lm_head.weight"]
+    assert got.dtype == torch.bfloat16
+    torch.testing.assert_close(got, dequantize_weight(w, s, torch.bfloat16, (128, 128)))
+
+
+def test_adapt_scale_before_weight_flushes_pending():
+    # non-target (lm_head) scale arrives BEFORE its weight -> dequant still correct
+    w = _fp8(256, 128)
+    s = _scale(256, 128)
+    stream = [
+        ("transformer.lm_head.weight_quantizer._scale", s),
+        ("transformer.lm_head.weight", w),
+        ("transformer.lm_head.weight_quantizer._amax", _amax(256, 128)),
+    ]
+    out = dict(_adapter(_sidecar(n_quantized=1, n_scale=2)).adapt(stream))
+    torch.testing.assert_close(
+        out["transformer.lm_head.weight"], dequantize_weight(w, s, torch.bfloat16, (128, 128))
+    )
+
+
+def test_adapt_max_pending_overflow_aborts():
+    # >8 non-target fp8 weights buffered without scales -> fail-fast (no GB buffering)
+    stream = [(f"transformer.extra{i}.weight", _fp8(128, 128)) for i in range(9)]
+    with pytest.raises(CheckpointIntegrityError, match="pending"):
+        dict(_adapter(_sidecar(n_quantized=9, n_scale=18)).adapt(stream))
+
+
+def test_is_fp8_dtype_classifies_guard_dtypes():
+    # The pipeline_cosmos3 load-guard exempts fp8->fp8 only; its decision rests on
+    # is_fp8_dtype classifying float8 as fp8, and bf16 (dequant path) / uint8 (NVFP4
+    # packed) as NOT fp8 (so the guard stays active for them).
+    assert is_fp8_dtype(torch.float8_e4m3fn) is True
+    assert is_fp8_dtype(torch.bfloat16) is False
+    assert is_fp8_dtype(torch.uint8) is False

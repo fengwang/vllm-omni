@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
-
 import torch
 from torch import nn
+
+from vllm_omni.quantization.fp8_blockwise_w8a16 import w8a16_enabled
 
 from .modelopt import (
     ModelOptFp8CheckpointAdapter,
@@ -14,12 +14,11 @@ from .modelopt_native import ModelOptNativeFp8CheckpointAdapter
 from .modelopt_native_fp8_w8a16 import ModelOptNativeFp8W8A16CheckpointAdapter
 from .modelopt_native_nvfp4 import ModelOptNativeNvfp4CheckpointAdapter
 
-# Opt-in flag (P6-S2): when set, the FP8-blockwise checkpoint is served
-# W8A16-**resident** (MLP targets FP8-resident, per-op dequant) instead of the
-# default dequant-on-load path. Necessary because FP8-dist carries no
-# ``quant_recipe`` hook and the checkpoint is immutable. Unset ⇒ dequant path
-# (INV-6 fallback + GATE-S2-W8A16 NO-GO escape).
-FP8_W8A16_FLAG = "COSMOS3_FP8_W8A16"
+# P6-S2 opt-in (`COSMOS3_FP8_W8A16`, via w8a16_enabled): when set, the FP8-blockwise
+# checkpoint is served W8A16-**resident** (MLP targets FP8-resident, per-op dequant)
+# instead of the default dequant-on-load path. Necessary because FP8-dist carries no
+# ``quant_recipe`` hook and the checkpoint is immutable. Unset ⇒ dequant path (INV-6
+# fallback + GATE-S2-W8A16 NO-GO escape).
 
 
 def _model_dtype(model: nn.Module) -> torch.dtype:
@@ -52,7 +51,7 @@ def get_checkpoint_adapter(
         # W8A16-resident. This must precede the dequant FP8 adapter (both key off the
         # same root quantization_config.json); it returns None for the NVFP4 sidecar,
         # so NVFP4 is unaffected either way.
-        if os.environ.get(FP8_W8A16_FLAG) == "1":
+        if w8a16_enabled():
             w8a16_adapter = ModelOptNativeFp8W8A16CheckpointAdapter.detect(
                 source, target_dtype=_model_dtype(model)
             )

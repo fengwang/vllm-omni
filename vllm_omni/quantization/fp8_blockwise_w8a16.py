@@ -27,6 +27,7 @@ boundary): :class:`Fp8BlockwiseW8A16LinearMethod`. Config factories:
 :func:`build_fp8_blockwise_w8a16_config`, :func:`maybe_build_fp8_blockwise_w8a16_config`.
 """
 
+import os
 import re
 
 import torch
@@ -42,6 +43,17 @@ BLOCK = (128, 128)  # blockwise-128x128 (declared in quantization_config.json)
 # Deploy-side marker (mirrors the native adapters): its presence + this string in the
 # serve log proves the W8A16-resident path (not dequant-on-load) is engaged.
 W8A16_MARKER = "cosmos3-fp8-blockwise-w8a16/p6s2"
+
+# Single source of truth for the opt-in selector: read by BOTH the adapter dispatch
+# (checkpoint_adapters/__init__.py) and the transformer construction hook
+# (transformer_cosmos3.py). Centralized so the flag name and the truth-compare cannot
+# drift between sites (a drift would silently break the INV-6 dequant fallback).
+FP8_W8A16_FLAG = "COSMOS3_FP8_W8A16"
+
+
+def w8a16_enabled() -> bool:
+    """True iff the W8A16 opt-in env flag is set (the single-sourced selector)."""
+    return os.environ.get(FP8_W8A16_FLAG) == "1"
 
 # The 216 quantized MLP projections (both UND ``mlp.*`` and GEN ``mlp_moe_gen.*``).
 # ``lm_head`` is deliberately EXCLUDED (INV-7: ``lm_head`` stays BF16 at compute; the
