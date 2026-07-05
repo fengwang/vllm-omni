@@ -16,17 +16,22 @@ for a normal BF16 GEMM (W8A16 — weights FP8, activations BF16), reusing the te
 non-target stay/become BF16 at compute (INV-7). It mirrors the NVFP4 W4A16 structure
 (:mod:`vllm_omni.quantization.nvfp4_blockwise`).
 
-Selection is gated: FP8-dist's ``transformer/config.json`` carries no ``quant_recipe``
-(unlike NVFP4) and the checkpoint is immutable, so the path is opt-in via the
-``COSMOS3_FP8_W8A16`` env flag, resolved at transformer construction. Flag unset ⇒ the
-dequant-on-load path is served unchanged (INV-6 fallback + the GATE-S2-W8A16 NO-GO
-escape).
+Selection is disk-recipe-gated (P6-S3): FP8-dist's ``transformer/config.json`` carries no
+``quant_recipe`` (unlike NVFP4), but its root ``quantization_config.json`` declares
+``recipe: fp8_blockwise_mixed``. That disk signal — not an operator flag — makes W8A16 the
+**default** served path for the FP8-blockwise checkpoint; :func:`fp8_w8a16_selected` reads
+it, and both the construction hook (``transformer_cosmos3.py``) and the load dispatch
+(``checkpoint_adapters/__init__.py``) consult the same predicate so they cannot drift. The
+dequant-on-load path stays reachable as an explicit diagnostic fallback via
+``COSMOS3_FP8_DEQUANT=1`` (INV-6 + a clean A/B switch).
 
-Pure calculation (no I/O): :func:`is_target_prefix`. Compute (Action at the GEMM
-boundary): :class:`Fp8BlockwiseW8A16LinearMethod`. Config factories:
-:func:`build_fp8_blockwise_w8a16_config`, :func:`maybe_build_fp8_blockwise_w8a16_config`.
+Pure calculations (no mutation): :func:`is_target_prefix`, :func:`fp8_w8a16_selected`.
+Compute (Action at the GEMM boundary): :class:`Fp8BlockwiseW8A16LinearMethod`. Config
+factories: :func:`build_fp8_blockwise_w8a16_config`,
+:func:`maybe_build_fp8_blockwise_w8a16_config`.
 """
 
+import json
 import os
 import re
 
@@ -44,16 +49,53 @@ BLOCK = (128, 128)  # blockwise-128x128 (declared in quantization_config.json)
 # serve log proves the W8A16-resident path (not dequant-on-load) is engaged.
 W8A16_MARKER = "cosmos3-fp8-blockwise-w8a16/p6s2"
 
-# Single source of truth for the opt-in selector: read by BOTH the adapter dispatch
-# (checkpoint_adapters/__init__.py) and the transformer construction hook
-# (transformer_cosmos3.py). Centralized so the flag name and the truth-compare cannot
-# drift between sites (a drift would silently break the INV-6 dequant fallback).
-FP8_W8A16_FLAG = "COSMOS3_FP8_W8A16"
+# Explicit diagnostic opt-out: force the dequant-on-load fallback for the FP8-blockwise
+# checkpoint (INV-6). W8A16 is the DEFAULT for that checkpoint, so this is the only knob
+# needed; the dispatch/construction sites log when it flips the served path.
+FP8_DEQUANT_FLAG = "COSMOS3_FP8_DEQUANT"
 
 
-def w8a16_enabled() -> bool:
-    """True iff the W8A16 opt-in env flag is set (the single-sourced selector)."""
-    return os.environ.get(FP8_W8A16_FLAG) == "1"
+def fp8_dequant_forced() -> bool:
+    """True iff the diagnostic dequant opt-out env flag is set."""
+    return os.environ.get(FP8_DEQUANT_FLAG) == "1"
+
+
+def _is_fp8_blockwise_dir(model_dir: str | None) -> bool:
+    """True iff *model_dir*'s root ``quantization_config.json`` declares the fp8_blockwise
+    recipe (a disk read that returns data; no mutation).
+
+    Keys on ``recipe`` only. The quantized target family is enforced fail-fast at adapter
+    engagement (:func:`...modelopt_native_fp8_w8a16.assert_target_family`), so a
+    recipe-matching but mis-declared checkpoint fails loudly there rather than being
+    silently mis-routed here. A missing/unreadable sidecar (plain BF16, NVFP4) ⇒ False.
+    """
+    if not model_dir:
+        return False
+    # Single-source the sidecar filename AND the recipe string from the dequant adapter's
+    # constants, so this selection predicate compares against the SAME recipe the adapter's
+    # parse_quant_spec validates against — they cannot drift into a select-vs-reject
+    # split-brain (both describe the one fp8_blockwise deliverable).
+    from vllm_omni.diffusion.model_loader.checkpoint_adapters.modelopt_native import (
+        EXPECTED_RECIPE,
+        SIDECAR_FILENAME,
+    )
+
+    try:
+        with open(os.path.join(model_dir, SIDECAR_FILENAME)) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError, TypeError):
+        # Fail-closed on ANY unreadable/malformed sidecar (missing file, bad JSON,
+        # non-UTF-8, or a non-path model_dir) — return False, never crash the load.
+        return False
+    return isinstance(data, dict) and data.get("recipe") == EXPECTED_RECIPE
+
+
+def fp8_w8a16_selected(model_dir: str | None) -> bool:
+    """Single source of truth: serve the FP8-blockwise checkpoint W8A16-resident by
+    default, unless the diagnostic dequant opt-out is set. Consulted identically by the
+    transformer construction hook and the load dispatch so they cannot drift.
+    """
+    return _is_fp8_blockwise_dir(model_dir) and not fp8_dequant_forced()
 
 # The 216 quantized MLP projections (both UND ``mlp.*`` and GEN ``mlp_moe_gen.*``).
 # ``lm_head`` is deliberately EXCLUDED (INV-7: ``lm_head`` stays BF16 at compute; the
@@ -137,7 +179,13 @@ class Fp8BlockwiseW8A16LinearMethod(LinearMethodBase):
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Assert real FP8 residency (kills silent dequant-on-load) and log proof."""
+        """Assert real FP8 residency + a well-formed block-scale grid, then log proof.
+
+        Residency (``element_size()==1`` — kills silent dequant-on-load) AND scale-grid
+        shape (``ceil(out/128) x ceil(in/128)`` — kills a malformed/transposed scale that
+        would corrupt the per-op dequant) are checked fail-fast; a violation raises and
+        serving does not start.
+        """
         weight = layer.weight
         if weight.dtype != torch.float8_e4m3fn or weight.element_size() != 1:
             raise ValueError(
@@ -145,11 +193,25 @@ class Fp8BlockwiseW8A16LinearMethod(LinearMethodBase):
                 f"element_size={weight.element_size()} (expected float8_e4m3fn, 1 "
                 "byte). A silent dequant-on-load would defeat the VRAM goal."
             )
+        block_n, block_k = layer.weight_block_size
+        expected = (
+            (layer.output_size_per_partition + block_n - 1) // block_n,
+            (layer.input_size_per_partition + block_k - 1) // block_k,
+        )
+        got = tuple(layer.weight_scale.shape)
+        if got != expected:
+            raise ValueError(
+                f"W8A16 scale-grid shape {got} != expected {expected} for block "
+                f"{(block_n, block_k)} on "
+                f"{layer.output_size_per_partition}x{layer.input_size_per_partition}; "
+                "a malformed/transposed scale would corrupt the per-op dequant."
+            )
         logger.info(
-            "W8A16 resident target: dtype=%s elem=%d shape=%s block=%s (marker: %s)",
+            "W8A16 resident target: dtype=%s elem=%d shape=%s scale=%s block=%s (marker: %s)",
             weight.dtype,
             weight.element_size(),
             tuple(weight.shape),
+            got,
             layer.weight_block_size,
             W8A16_MARKER,
         )
@@ -221,18 +283,19 @@ def build_fp8_blockwise_w8a16_config():
 def maybe_build_fp8_blockwise_w8a16_config(enabled, active_quant_config=None):
     """Return the W8A16 config when *enabled*, else *active_quant_config* unchanged.
 
-    *enabled* is the resolved ``COSMOS3_FP8_W8A16`` opt-in. Mirrors the intent of
-    :func:`vllm_omni.quantization.nvfp4_blockwise.maybe_build_nvfp4_blockwise_config`,
-    but gated on an explicit flag rather than a checkpoint ``quant_recipe`` (which the
-    FP8-dist checkpoint lacks). Never overrides an already-active config (e.g. the
-    NVFP4 W4A16 config): W8A16 only fills the FP8-dist case where no ``quant_recipe``
-    hook produced one.
+    *enabled* is the resolved :func:`fp8_w8a16_selected` decision (W8A16 is the default for
+    the FP8-blockwise checkpoint; the dequant opt-out yields False). Mirrors the intent of
+    :func:`vllm_omni.quantization.nvfp4_blockwise.maybe_build_nvfp4_blockwise_config`, but
+    gated on the checkpoint's on-disk ``quantization_config.json`` recipe rather than a
+    ``quant_recipe`` in ``transformer/config.json`` (which the FP8-dist checkpoint lacks).
+    Never overrides an already-active config (e.g. the NVFP4 W4A16 config): W8A16 only fills
+    the FP8-dist case where no ``quant_recipe`` hook produced one.
     """
     if not enabled:
         return active_quant_config
     if active_quant_config is not None:
         logger.info(
-            "COSMOS3_FP8_W8A16 set but a quant_config (%s) is already active; "
+            "fp8_w8a16 selected but a quant_config (%s) is already active; "
             "keeping it (W8A16 does not override NVFP4/explicit configs).",
             getattr(active_quant_config, "get_name", lambda: active_quant_config)(),
         )

@@ -1095,18 +1095,19 @@ class Cosmos3VFMTransformer(nn.Module):
             _tf_config_get(model_config, "quant_recipe", None), quant_config
         )
 
-        # P6-S2 spike: the FP8-dist checkpoint carries no `quant_recipe`, so its
-        # W8A16 weight-resident path is opt-in via COSMOS3_FP8_W8A16 (resolved here
-        # symmetrically, via the single-sourced w8a16_enabled). This never overrides
-        # the NVFP4 config resolved above; unset ⇒ the FP8 dequant-on-load path is
-        # served unchanged (INV-6 fallback).
+        # P6-S3: the FP8-dist checkpoint carries no `quant_recipe`, but its root
+        # `quantization_config.json` recipe makes W8A16 weight-resident the DEFAULT served
+        # path. `fp8_w8a16_selected(od_config.model)` reads that disk signal — the same
+        # single-sourced predicate the load dispatch uses, so construction and load agree.
+        # This never overrides the NVFP4 config resolved above; `COSMOS3_FP8_DEQUANT=1` ⇒
+        # the FP8 dequant-on-load path is served instead (INV-6 diagnostic fallback).
         from vllm_omni.quantization.fp8_blockwise_w8a16 import (
+            fp8_w8a16_selected,
             maybe_build_fp8_blockwise_w8a16_config,
-            w8a16_enabled,
         )
 
         quant_config = maybe_build_fp8_blockwise_w8a16_config(
-            w8a16_enabled(), quant_config
+            fp8_w8a16_selected(getattr(od_config, "model", None)), quant_config
         )
 
         self.language_model = Cosmos3LanguageModel(

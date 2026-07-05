@@ -3,7 +3,7 @@
 import torch
 from torch import nn
 
-from vllm_omni.quantization.fp8_blockwise_w8a16 import w8a16_enabled
+from vllm_omni.quantization.fp8_blockwise_w8a16 import fp8_w8a16_selected
 
 from .modelopt import (
     ModelOptFp8CheckpointAdapter,
@@ -14,11 +14,11 @@ from .modelopt_native import ModelOptNativeFp8CheckpointAdapter
 from .modelopt_native_fp8_w8a16 import ModelOptNativeFp8W8A16CheckpointAdapter
 from .modelopt_native_nvfp4 import ModelOptNativeNvfp4CheckpointAdapter
 
-# P6-S2 opt-in (`COSMOS3_FP8_W8A16`, via w8a16_enabled): when set, the FP8-blockwise
-# checkpoint is served W8A16-**resident** (MLP targets FP8-resident, per-op dequant)
-# instead of the default dequant-on-load path. Necessary because FP8-dist carries no
-# ``quant_recipe`` hook and the checkpoint is immutable. Unset ⇒ dequant path (INV-6
-# fallback + GATE-S2-W8A16 NO-GO escape).
+# P6-S3 default (recipe-gated, via fp8_w8a16_selected): the FP8-blockwise checkpoint is
+# served W8A16-**resident** (MLP targets FP8-resident, per-op dequant) BY DEFAULT, keyed on
+# its root ``quantization_config.json`` recipe (FP8-dist carries no ``quant_recipe`` hook).
+# ``COSMOS3_FP8_DEQUANT=1`` forces the dequant-on-load path instead (INV-6 diagnostic
+# fallback). The same predicate gates the transformer construction hook, so the two agree.
 
 
 def _model_dtype(model: nn.Module) -> torch.dtype:
@@ -47,11 +47,12 @@ def get_checkpoint_adapter(
         # native adapters key off distinct sidecar filenames, so order is safe;
         # both must precede the generic quant_config-driven adapters below.
         #
-        # P6-S2: when COSMOS3_FP8_W8A16 is set, the FP8-blockwise sidecar is served
-        # W8A16-resident. This must precede the dequant FP8 adapter (both key off the
-        # same root quantization_config.json); it returns None for the NVFP4 sidecar,
-        # so NVFP4 is unaffected either way.
-        if w8a16_enabled():
+        # P6-S3: the FP8-blockwise checkpoint is served W8A16-resident BY DEFAULT
+        # (fp8_w8a16_selected reads the root quantization_config.json recipe). This must
+        # precede the dequant FP8 adapter (both key off the same sidecar). The predicate is
+        # False for the NVFP4 sidecar and when COSMOS3_FP8_DEQUANT=1, so NVFP4 is unaffected
+        # and the dequant fallback stays reachable (INV-6).
+        if fp8_w8a16_selected(getattr(source, "model_or_path", None)):
             w8a16_adapter = ModelOptNativeFp8W8A16CheckpointAdapter.detect(
                 source, target_dtype=_model_dtype(model)
             )

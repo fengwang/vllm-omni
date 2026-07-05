@@ -4,6 +4,7 @@
 
 Scenarios: docs/session_2/specs/fp8-w8a16-resident-linear.md.
 """
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -92,6 +93,50 @@ def test_maybe_build_enabled_never_overrides_active_config():
     assert w8.maybe_build_fp8_blockwise_w8a16_config(True, nvfp4) is nvfp4
 
 
+# --- recipe-gated default selection (P6-S3) ----------------------------------
+
+
+def _sidecar_dir(root, recipe="fp8_blockwise_mixed"):
+    """Write a minimal root quantization_config.json and return the dir path."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "quantization_config.json").write_text(json.dumps({"recipe": recipe}))
+    return str(root)
+
+
+def test_fp8_dequant_forced(monkeypatch):
+    monkeypatch.delenv("COSMOS3_FP8_DEQUANT", raising=False)
+    assert w8.fp8_dequant_forced() is False
+    monkeypatch.setenv("COSMOS3_FP8_DEQUANT", "1")
+    assert w8.fp8_dequant_forced() is True
+    monkeypatch.setenv("COSMOS3_FP8_DEQUANT", "0")  # only "1" opts out
+    assert w8.fp8_dequant_forced() is False
+
+
+def test_fp8_w8a16_selected_default_on_for_fp8_blockwise(tmp_path, monkeypatch):
+    monkeypatch.delenv("COSMOS3_FP8_DEQUANT", raising=False)
+    # the fp8_blockwise recipe -> W8A16 is the default, no opt-in flag needed
+    assert w8.fp8_w8a16_selected(_sidecar_dir(tmp_path / "fp8")) is True
+
+
+def test_fp8_w8a16_selected_opt_out_forces_dequant(tmp_path, monkeypatch):
+    root = _sidecar_dir(tmp_path / "fp8")
+    monkeypatch.setenv("COSMOS3_FP8_DEQUANT", "1")
+    assert w8.fp8_w8a16_selected(root) is False
+
+
+def test_fp8_w8a16_selected_declines_non_fp8_blockwise(tmp_path, monkeypatch):
+    monkeypatch.delenv("COSMOS3_FP8_DEQUANT", raising=False)
+    # foreign recipe (mirrors NVFP4) -> declines (predicate is False, no raise here)
+    assert w8.fp8_w8a16_selected(
+        _sidecar_dir(tmp_path / "nv", recipe="nvfp4_blockwise_mixed_v1")
+    ) is False
+    # missing sidecar (plain BF16 dir) -> declines
+    (tmp_path / "bf16").mkdir()
+    assert w8.fp8_w8a16_selected(str(tmp_path / "bf16")) is False
+    # no path -> declines
+    assert w8.fp8_w8a16_selected(None) is False
+
+
 # --- linear method: residency, weight-only, JIT dequant ----------------------
 
 
@@ -145,10 +190,14 @@ def test_apply_dequantizes_per_op_then_gemm():
     torch.testing.assert_close(got, ref)
 
 
-def test_process_weights_after_loading_passes_on_fp8():
+def test_process_weights_after_loading_passes_on_fp8_with_valid_scale_grid():
     method = _method()
+    # 256x128, block 128x128 -> scale grid (ceil(256/128), ceil(128/128)) = (2, 1)
     layer = SimpleNamespace(
-        weight=torch.zeros(128, 128).to(torch.float8_e4m3fn),
+        weight=torch.zeros(256, 128).to(torch.float8_e4m3fn),
+        weight_scale=torch.ones(2, 1, dtype=torch.bfloat16),
+        output_size_per_partition=256,
+        input_size_per_partition=128,
         weight_block_size=[128, 128],
     )
     method.process_weights_after_loading(layer)  # must not raise
@@ -160,5 +209,20 @@ def test_process_weights_after_loading_rejects_bf16_silent_dequant():
         weight=torch.zeros(128, 128, dtype=torch.bfloat16),
         weight_block_size=[128, 128],
     )
+    # residency check fires before the scale-grid check (no scale attrs needed)
     with pytest.raises(ValueError, match="residency"):
+        method.process_weights_after_loading(layer)
+
+
+def test_process_weights_after_loading_rejects_wrong_scale_grid():
+    method = _method()
+    # transposed grid (1, 2) != expected (2, 1) -> malformed scale rejected
+    layer = SimpleNamespace(
+        weight=torch.zeros(256, 128).to(torch.float8_e4m3fn),
+        weight_scale=torch.ones(1, 2, dtype=torch.bfloat16),
+        output_size_per_partition=256,
+        input_size_per_partition=128,
+        weight_block_size=[128, 128],
+    )
+    with pytest.raises(ValueError, match="scale-grid"):
         method.process_weights_after_loading(layer)

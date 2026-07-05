@@ -68,3 +68,39 @@ def test_load_weights_still_rejects_unadapted_fp8_weight():
     ]
     with pytest.raises(_integrity_error()):
         pipe.load_weights(iter(stream))
+
+
+class _StubTransformerFp8Dest(nn.Module):
+    """Stub whose state_dict exposes an fp8-resident destination param, mimicking a W8A16
+    MLP target after create_weights. ``proj_in`` has an identity remap, so streaming a
+    matching fp8 weight exercises the guard's fp8->fp8 exemption through load_weights."""
+
+    sound_gen = False
+    action_gen = False
+
+    def __init__(self) -> None:
+        super().__init__()
+        proj = nn.Module()
+        proj.register_buffer("weight", torch.zeros(4, 4, dtype=torch.float8_e4m3fn))
+        self.proj_in = proj
+
+    def post_load_weights(self) -> None:
+        pass
+
+
+def test_load_weights_admits_fp8_weight_when_dest_is_fp8_resident():
+    """P6-S3 (task 3.3, S2 eval-seed gap): the fp8->fp8 guard exemption, through the real
+    load_weights wiring. An incoming fp8 ``.weight`` whose destination param is itself
+    fp8-resident (the W8A16-resident MLP targets) must be ADMITTED, not aborted — the
+    complement of the reject test above (bf16/absent dest). A regression that dropped the
+    ``_dest_param_is_fp8`` call would spuriously abort every W8A16 load; this pins it."""
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+        Cosmos3OmniDiffusersPipeline,
+    )
+
+    pipe = object.__new__(Cosmos3OmniDiffusersPipeline)
+    nn.Module.__init__(pipe)
+    pipe.transformer = _StubTransformerFp8Dest()
+    # dest transformer.proj_in.weight is fp8-resident -> the guard must NOT abort.
+    stream = [("transformer.proj_in.weight", torch.zeros(4, 4, dtype=torch.float8_e4m3fn))]
+    pipe.load_weights(iter(stream))  # must not raise CheckpointIntegrityError

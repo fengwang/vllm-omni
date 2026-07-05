@@ -628,6 +628,21 @@ def get_cosmos3_ir_op_priority_func(od_config: OmniDiffusionConfig):
     return ir_op_priority_func
 
 
+def _dest_param_is_fp8(state: dict, remapped_name: str | None) -> bool:
+    """Pure: is the destination parameter for *remapped_name* an fp8 tensor?
+
+    The fp8 load-guard in :meth:`Cosmos3OmniDiffusersPipeline.load_weights` exempts an
+    incoming fp8 *weight* only when its destination param is itself fp8 — i.e. the W8A16
+    (P6-S2/S3) MLP targets that are FP8-resident by design. NVFP4 FP4-resident params are
+    ``uint8`` (not fp8) so they stay guarded; a ``None`` remap or a missing dest is not
+    exempt. Lifted from a closure so the guard's decision is unit-testable (P6-S3).
+    """
+    if remapped_name is None:
+        return False
+    dest = state.get(remapped_name)
+    return dest is not None and is_fp8_dtype(dest.dtype)
+
+
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
@@ -948,15 +963,6 @@ class Cosmos3OmniDiffusersPipeline(
         # un-dequantized weights, so they are exempt from the fp8 bypass guard.
         _QUANT_SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2")
 
-        def _dest_is_fp8(remapped_name: str | None) -> bool:
-            # W8A16 (P6-S2) keeps mlp.*/mlp_moe_gen.* weights FP8-resident, so the
-            # destination param is itself fp8 and an fp8 weight here is intended,
-            # not a bypassed dequant. Exempt only when the target param is fp8.
-            if remapped_name is None:
-                return False
-            dest = state.get(remapped_name)
-            return dest is not None and is_fp8_dtype(dest.dtype)
-
         def _remapped_weights() -> Iterable[tuple[str, torch.Tensor]]:
             total = kept = 0
             for name, tensor in weights:
@@ -969,7 +975,7 @@ class Cosmos3OmniDiffusersPipeline(
                 # (`.weight_scale`/`.weight_scale_2`), and (b) fp8 weights whose
                 # destination param is itself fp8 (NVFP4 FP4-resident uint8 is not
                 # fp8 so still passes; W8A16 FP8-resident params load fp8 by design).
-                if not name.endswith(_QUANT_SCALE_SUFFIXES) and not _dest_is_fp8(remapped):
+                if not name.endswith(_QUANT_SCALE_SUFFIXES) and not _dest_param_is_fp8(state, remapped):
                     assert_not_fp8(name, tensor.dtype)
                 if remapped is not None and (remapped in allowed or remapped in tp_aware):
                     kept += 1

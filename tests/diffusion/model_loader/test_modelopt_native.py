@@ -365,7 +365,12 @@ def test_detect_paths(tmp_path):
     assert adapter is not None
 
 
-def test_get_checkpoint_adapter_engages_without_quant_config(tmp_path):
+def test_get_checkpoint_adapter_engages_without_quant_config(tmp_path, monkeypatch):
+    # P6-S3: W8A16-resident is now the DEFAULT for the fp8_blockwise checkpoint; the
+    # dequant-on-load native adapter is the explicit diagnostic fallback. Opt out so this
+    # test exercises the dequant adapter's sidecar-driven engagement (its intent). The
+    # default->W8A16 and opt-out->dequant routing is covered in test_modelopt_native_fp8_w8a16.
+    monkeypatch.setenv("COSMOS3_FP8_DEQUANT", "1")
     root = _write_model_dir(tmp_path, _authoritative_sidecar())
     model = _TinyModel()
     adapter = get_checkpoint_adapter(

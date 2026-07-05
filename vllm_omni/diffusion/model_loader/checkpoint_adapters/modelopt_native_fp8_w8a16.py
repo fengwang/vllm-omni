@@ -24,8 +24,10 @@ Integrity is fail-fast (INV-6/INV-P5-4), reusing the dequant adapter's
 ``transformer/modelopt_state.pt`` pickle is never opened. A GPU-free header probe is
 available as ``python -m ...modelopt_native_fp8_w8a16 <model_dir>``.
 
-Selected by the dispatcher only when ``COSMOS3_FP8_W8A16`` is set (see
-``checkpoint_adapters/__init__.py``); otherwise the dequant adapter runs (INV-6).
+Selected by the dispatcher **by default** for the FP8-blockwise checkpoint (see
+``fp8_w8a16_selected`` in ``checkpoint_adapters/__init__.py``); ``COSMOS3_FP8_DEQUANT=1``
+routes to the dequant adapter instead (INV-6). A checkpoint whose sidecar declares a
+quantized target family outside ``mlp.*``/``mlp_moe_gen.*``/``lm_head`` fails fast (INV-7).
 """
 
 import glob
@@ -79,10 +81,32 @@ def assert_scale_finite(name: str, tensor: torch.Tensor) -> None:
         )
 
 
+# The families W8A16 may ever quantize (INV-7): the MLP projections stay FP8-resident and
+# ``lm_head`` is dequant-to-BF16. Any other declared quantized family is refused fail-fast.
+_ALLOWED_QUANT_FAMILIES = ("mlp", "mlp_moe_gen", "lm_head")
+
+
+def assert_target_family(spec) -> None:
+    """Fail-fast (INV-7): every declared quantized pattern is in the W8A16 target family.
+
+    Defends a sidecar whose manifest *declares* a forbidden family (e.g. ``self_attn.*``),
+    which the end-of-stream :func:`verify_observations` would otherwise accept as a
+    'declared' pattern. Pure calculation over the parsed spec; raises before any load.
+    """
+    for pattern in spec.quantized_patterns:
+        family = pattern.split(".", 1)[0]
+        if family not in _ALLOWED_QUANT_FAMILIES:
+            raise CheckpointIntegrityError(
+                f"quantized pattern {pattern!r} is outside the W8A16 target family "
+                f"{_ALLOWED_QUANT_FAMILIES} (INV-7); refusing to serve W8A16-resident."
+            )
+
+
 class ModelOptNativeFp8W8A16CheckpointAdapter:
     """Streams the FP8-blockwise checkpoint W8A16-resident (MLP resident, lm_head BF16)."""
 
     def __init__(self, spec, source_prefix: str, target_dtype: torch.dtype) -> None:
+        assert_target_family(spec)  # INV-7 fail-fast before any weight is routed resident
         self._spec = spec
         self._prefix = source_prefix
         self._target_dtype = target_dtype
@@ -97,7 +121,9 @@ class ModelOptNativeFp8W8A16CheckpointAdapter:
         """Engage iff the source carries the FP8-blockwise sidecar (same as dequant).
 
         Reuses the dequant adapter's sidecar parse so detection is identical; the
-        dispatcher decides W8A16-vs-dequant via the ``COSMOS3_FP8_W8A16`` flag.
+        dispatcher decides W8A16-vs-dequant via ``fp8_w8a16_selected`` (W8A16 by default;
+        ``COSMOS3_FP8_DEQUANT=1`` opts out). Construction asserts the declared target family
+        (INV-7), so a mis-declared sidecar fails fast here rather than mid-load.
         """
         spec = ModelOptNativeFp8CheckpointAdapter._parse_source_sidecar(source)
         if spec is None:

@@ -195,11 +195,12 @@ def test_probe_main_usage():
     assert mw8.main([]) == 2
 
 
-# --- gated dispatch (flag selects resident vs dequant) -----------------------
+# --- recipe-gated dispatch (P6-S3: W8A16 default, dequant via opt-out) --------
 
 
-def test_dispatch_flag_on_selects_w8a16(tmp_path, monkeypatch):
-    monkeypatch.setenv("COSMOS3_FP8_W8A16", "1")
+def test_dispatch_default_selects_w8a16(tmp_path, monkeypatch):
+    # No env flag needed: the fp8_blockwise recipe makes W8A16 the default.
+    monkeypatch.delenv("COSMOS3_FP8_DEQUANT", raising=False)
     root = _write_model_dir(tmp_path)
     adapter = get_checkpoint_adapter(
         torch.nn.Module(), _source(root), quant_config=None, use_safetensors=True
@@ -207,8 +208,8 @@ def test_dispatch_flag_on_selects_w8a16(tmp_path, monkeypatch):
     assert isinstance(adapter, ModelOptNativeFp8W8A16CheckpointAdapter)
 
 
-def test_dispatch_flag_off_selects_dequant(tmp_path, monkeypatch):
-    monkeypatch.delenv("COSMOS3_FP8_W8A16", raising=False)
+def test_dispatch_opt_out_selects_dequant(tmp_path, monkeypatch):
+    monkeypatch.setenv("COSMOS3_FP8_DEQUANT", "1")
     root = _write_model_dir(tmp_path)
     adapter = get_checkpoint_adapter(
         torch.nn.Module(), _source(root), quant_config=None, use_safetensors=True
@@ -217,16 +218,27 @@ def test_dispatch_flag_off_selects_dequant(tmp_path, monkeypatch):
     assert not isinstance(adapter, ModelOptNativeFp8W8A16CheckpointAdapter)
 
 
-def test_dispatch_flag_on_inert_without_fp8_sidecar(tmp_path, monkeypatch):
+def test_dispatch_default_inert_without_fp8_sidecar(tmp_path, monkeypatch):
     # No FP8 sidecar (mirrors NVFP4-dist, which has no root quantization_config.json):
-    # the flag must NOT engage W8A16, so NVFP4 selection is unaffected.
-    monkeypatch.setenv("COSMOS3_FP8_W8A16", "1")
+    # the recipe predicate is False, so W8A16 does not engage and NVFP4 is unaffected.
+    monkeypatch.delenv("COSMOS3_FP8_DEQUANT", raising=False)
     root = tmp_path / "no_sidecar"
     (root / "transformer").mkdir(parents=True)
     adapter = get_checkpoint_adapter(
         torch.nn.Module(), _source(str(root)), quant_config=None, use_safetensors=True
     )
-    assert not isinstance(adapter, ModelOptNativeFp8W8A16CheckpointAdapter)
+    # No sidecar at all -> no adapter engages (W8A16 declines, dequant/NVFP4 find no
+    # sidecar); assert the exact None (stronger than "not W8A16", which None also satisfies).
+    assert adapter is None
+
+
+def test_adapter_rejects_declared_forbidden_family():
+    # A sidecar whose manifest DECLARES a forbidden family (self_attn.*) as quantized ->
+    # INV-7 fail-fast at adapter construction, before any weight is routed resident.
+    bad = _sidecar()
+    bad["mixed_precision"]["quantized"] = ["mlp.*", "self_attn.*"]
+    with pytest.raises(CheckpointIntegrityError, match="target family"):
+        _adapter(bad)
 
 
 # --- adapter numerical correctness + edge cases (sharded-review hardening) ---
@@ -275,3 +287,21 @@ def test_is_fp8_dtype_classifies_guard_dtypes():
     assert is_fp8_dtype(torch.float8_e4m3fn) is True
     assert is_fp8_dtype(torch.bfloat16) is False
     assert is_fp8_dtype(torch.uint8) is False
+
+
+def test_dest_param_is_fp8_guard_decision():
+    # P6-S3: the fp8->fp8 load guard's decision, lifted from a closure to a pure module
+    # function so it is unit-testable. Exempt an incoming fp8 weight ONLY when the
+    # destination param is itself fp8 (the W8A16 resident MLP targets).
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import _dest_param_is_fp8
+
+    state = {
+        "fp8_dest": torch.zeros(4, 4).to(torch.float8_e4m3fn),
+        "bf16_dest": torch.zeros(4, 4, dtype=torch.bfloat16),
+        "nvfp4_dest": torch.zeros(4, 4, dtype=torch.uint8),  # FP4-resident packed
+    }
+    assert _dest_param_is_fp8(state, "fp8_dest") is True  # W8A16 resident: exempt
+    assert _dest_param_is_fp8(state, "bf16_dest") is False  # dequant path: guard active
+    assert _dest_param_is_fp8(state, "nvfp4_dest") is False  # uint8 not fp8: guard active
+    assert _dest_param_is_fp8(state, "absent") is False  # missing dest: not exempt
+    assert _dest_param_is_fp8(state, None) is False  # None remap: not exempt
