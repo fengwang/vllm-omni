@@ -1095,6 +1095,20 @@ class Cosmos3VFMTransformer(nn.Module):
             _tf_config_get(model_config, "quant_recipe", None), quant_config
         )
 
+        # P6-S2 spike: the FP8-dist checkpoint carries no `quant_recipe`, so its
+        # W8A16 weight-resident path is opt-in via COSMOS3_FP8_W8A16 (resolved here
+        # symmetrically). This never overrides the NVFP4 config resolved above; unset
+        # ⇒ the FP8 dequant-on-load path is served unchanged (INV-6 fallback).
+        import os
+
+        from vllm_omni.quantization.fp8_blockwise_w8a16 import (
+            maybe_build_fp8_blockwise_w8a16_config,
+        )
+
+        quant_config = maybe_build_fp8_blockwise_w8a16_config(
+            os.environ.get("COSMOS3_FP8_W8A16") == "1", quant_config
+        )
+
         self.language_model = Cosmos3LanguageModel(
             hidden_size=self.hidden_size,
             intermediate_size=self.intermediate_size,
