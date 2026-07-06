@@ -82,6 +82,7 @@ __all__ = [
     "ModelOptMixedPrecisionCheckpointAdapter",
     "ModelOptNativeFp8CheckpointAdapter",
     "ModelOptNativeFp8W8A16CheckpointAdapter",
+    "ModelOptNativeNvfp4CheckpointAdapter",
     "ModelOptNvFp4CheckpointAdapter",
     "get_checkpoint_adapter",
 ]
