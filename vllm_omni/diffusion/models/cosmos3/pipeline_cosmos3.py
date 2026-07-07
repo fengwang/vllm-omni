@@ -53,6 +53,10 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.model_loader.checkpoint_adapters.modelopt_native import (
+    assert_not_fp8,
+    is_fp8_dtype,
+)
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
     ReferenceVideoDecodeSpec,
@@ -624,6 +628,21 @@ def get_cosmos3_ir_op_priority_func(od_config: OmniDiffusionConfig):
     return ir_op_priority_func
 
 
+def _dest_param_is_fp8(state: dict, remapped_name: str | None) -> bool:
+    """Pure: is the destination parameter for *remapped_name* an fp8 tensor?
+
+    The fp8 load-guard in :meth:`Cosmos3OmniDiffusersPipeline.load_weights` exempts an
+    incoming fp8 *weight* only when its destination param is itself fp8 — i.e. the W8A16
+    (P6-S2/S3) MLP targets that are FP8-resident by design. NVFP4 FP4-resident params are
+    ``uint8`` (not fp8) so they stay guarded; a ``None`` remap or a missing dest is not
+    exempt. Lifted from a closure so the guard's decision is unit-testable (P6-S3).
+    """
+    if remapped_name is None:
+        return False
+    dest = state.get(remapped_name)
+    return dest is not None and is_fp8_dtype(dest.dtype)
+
+
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
@@ -938,12 +957,26 @@ class Cosmos3OmniDiffusersPipeline(
         state = self.state_dict()
         allowed = set(state.keys())
         tp_aware = {n for n, p in self.named_parameters() if hasattr(p, "weight_loader")}
+        # ModelOpt NVFP4 W4A16 (nvfp4_blockwise) scale params carried through to
+        # the linear method: fp8 block scale (`.weight_scale`) + fp32 global
+        # scale (`.weight_scale_2`). These are quant-method inputs, not
+        # un-dequantized weights, so they are exempt from the fp8 bypass guard.
+        _QUANT_SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2")
 
         def _remapped_weights() -> Iterable[tuple[str, torch.Tensor]]:
             total = kept = 0
             for name, tensor in weights:
                 total += 1
                 remapped = self._remap_ckpt_key(name)
+                # Last-line guard: an un-adapted fp8 *weight* here means a quantized
+                # checkpoint bypassed its checkpoint adapter — loading it would
+                # silently drop the dequant scales (weights off by the per-block
+                # scale factor). Fail loudly. Exempt (a) NVFP4/W8A16 scale params
+                # (`.weight_scale`/`.weight_scale_2`), and (b) fp8 weights whose
+                # destination param is itself fp8 (NVFP4 FP4-resident uint8 is not
+                # fp8 so still passes; W8A16 FP8-resident params load fp8 by design).
+                if not name.endswith(_QUANT_SCALE_SUFFIXES) and not _dest_param_is_fp8(state, remapped):
+                    assert_not_fp8(name, tensor.dtype)
                 if remapped is not None and (remapped in allowed or remapped in tp_aware):
                     kept += 1
                     yield remapped, tensor

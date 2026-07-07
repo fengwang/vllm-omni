@@ -13,6 +13,7 @@ import torch.nn as nn
 from huggingface_hub import snapshot_download
 from vllm.config.load import LoadConfig
 
+import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
 from vllm_omni.diffusion.config import get_current_diffusion_config, get_current_diffusion_config_or_none
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -109,6 +110,50 @@ def test_empty_source_prefix_keeps_full_model_strict_check():
 
     with pytest.raises(ValueError, match="vae.weight"):
         loader.load_weights(model)
+
+
+def test_get_weights_iterator_validates_nvfp4_sidecar_before_weight_discovery(monkeypatch):
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+        quantization_config=None,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    loader.counter_before_loading_weights = 0.0
+    loader.counter_after_loading_weights = 0.0
+    source = DiffusersPipelineLoader.ComponentSource(
+        model_or_path="dummy",
+        subfolder="transformer",
+        revision=None,
+        prefix="transformer.",
+    )
+
+    class Nvfp4PreflightError(RuntimeError):
+        pass
+
+    monkeypatch.setattr(
+        loader_mod.ModelOptNativeFp8CheckpointAdapter,
+        "validate_source_sidecar",
+        lambda checked_source: None,
+    )
+
+    def _fail_nvfp4_preflight(checked_source):
+        assert checked_source is source
+        raise Nvfp4PreflightError("nvfp4 preflight")
+
+    monkeypatch.setattr(
+        loader_mod.ModelOptNativeNvfp4CheckpointAdapter,
+        "validate_source_sidecar",
+        _fail_nvfp4_preflight,
+    )
+    monkeypatch.setattr(
+        loader,
+        "_prepare_weights",
+        lambda *args, **kwargs: pytest.fail("weight discovery must not run before NVFP4 preflight"),
+    )
+
+    with pytest.raises(Nvfp4PreflightError, match="nvfp4 preflight"):
+        list(loader._get_weights_iterator(source))
 
 
 def test_qwen_model_class_selects_qwen_gguf_adapter():
